@@ -257,21 +257,32 @@ async def _on_end_of_turn(self, turn_info):
 
 ## 4. Buffer Management
 
-### Buffers
+### Buffers (Word-Level Tracking)
 
 | Buffer | Purpose |
 |--------|---------|
-| `current_buffer` | Accumulates user speech in current turn |
+| `current_buffer` | Accumulates user speech in current turn (word list) |
 | `interrupted_context` | Stores prompt that was interrupted before Claude responded |
-| `agent_response_buffer` | Accumulates tokens as Claude streams them |
-| `agent_output_position` | Tracks how much of agent response was actually spoken |
+| `agent_response_words` | Word list from LLM output (intended text) |
+| `agent_spoken_words` | Word list confirmed spoken by TTS (spoken text) |
+
+### Word-Level TTS Tracking
+
+Two parallel word lists track LLM output vs TTS playback:
+
+```
+LLM streams tokens  →  agent_response_words: ["Hello", "I", "can", "help", "you", "with", "..."]
+TTS plays audio     →  agent_spoken_words:   ["Hello", "I", "can", "help"]  # played so far
+User interrupts     →  intended: all words, spoken: spoken words only
+```
 
 ### Buffer Flow: Normal Turn
 
 ```
-User speaks → current_buffer accumulates
+User speaks → current_buffer accumulates words
 End of turn → current_buffer sent to Claude
-Claude responds → agent_response_buffer fills
+Claude responds → agent_response_words fills (word by word)
+TTS plays → agent_spoken_words tracks what was output
 Output completes → clear all buffers
 ```
 
@@ -289,12 +300,34 @@ Claude responds → clear interrupted_context after successful response
 ### Buffer Flow: User Interrupts During Agent Speaking
 
 ```
-Agent speaking → agent_response_buffer has full intended response
-              → agent_output_position tracks spoken portion
-User interrupts → slice agent_response_buffer at agent_output_position
-               → store intended vs spoken for context
+Agent speaking → agent_response_words = full intended response
+              → agent_spoken_words = words TTS has played
+User interrupts → intended = agent_response_words (all)
+               → spoken = agent_spoken_words (only played)
+               → store both for context
                → accumulate new speech to current_buffer
 End of turn → send full context (intended, spoken, user input) to Claude
+```
+
+### TTS Integration API
+
+```python
+# LLM streams tokens
+buffers.append_agent_token(token)  # Auto-splits into words
+
+# TTS reports words played
+buffers.mark_words_spoken(["Hello", "I", "can"])  # By word list
+# OR
+buffers.mark_words_spoken_by_count(4)  # By count
+
+# On interruption
+context = buffers.handle_speaking_interruption()
+# Returns: AgentInterruptedContext(
+#   intended="Hello I can help you with...",
+#   spoken="Hello I can",
+#   intended_words=["Hello", "I", "can", "help", "you", "with", "..."],
+#   spoken_words=["Hello", "I", "can"]
+# )
 ```
 
 ---
@@ -920,6 +953,12 @@ These invariants must always hold:
 ---
 
 ## Changelog
+
+### Version 1.3 (December 4, 2024)
+- **Added**: Word-level TTS tracking (Section 4)
+- **Added**: `agent_response_words` and `agent_spoken_words` buffers
+- **Added**: `mark_words_spoken()` and `mark_words_spoken_by_count()` TTS API
+- **Added**: Word lists in `AgentInterruptedContext` for precise interruption tracking
 
 ### Version 1.2 (December 4, 2024)
 - **Major Update**: Migrated from manual timing to Deepgram Flux event-driven architecture
