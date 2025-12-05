@@ -388,59 +388,641 @@ if should_fire_backchannel():
 
 ---
 
-## 6. ElevenLabs Output Layer
+## 6. ElevenLabs Output Layer (Multi-Context WebSocket)
 
 ### Role
 
-ElevenLabs converts text to speech. It receives streamed tokens from Claude and outputs audio chunks that publish to the agent's audio track.
+ElevenLabs converts text to speech. It receives streamed tokens from Claude via **Multi-Context WebSocket** and outputs audio chunks that publish to the agent's audio track.
+
+### Why Multi-Context WebSocket (Not HTTP Streaming)
+
+| Approach | Problem | Solution |
+|----------|---------|----------|
+| HTTP Streaming | Requires complete text upfront | Multi-Context allows token streaming |
+| Token-by-token HTTP | Choppy, unnatural prosody | context_id groups tokens for prosodic consistency |
+| Single WebSocket | Can't handle barge-in cleanly | Multi-context allows closing interrupted contexts |
+
+### Architecture
+
+```
+                    Single WebSocket Connection (per session)
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+      context_1               context_2               context_3
+   (response #1)           (response #2)           (backchannel)
+            │                       │                       │
+    "Hello, I can"          "Sure, let me"              "Mhmm"
+    "help you with"          (interrupted)
+    "scheduling..."
+```
+
+### WebSocket Endpoint
+
+```
+wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input?model_id={model_id}
+```
+
+**Models**: `eleven_turbo_v2_5` (fast), `eleven_flash_v2_5` (balanced)
+
+**Note**: Multi-context is NOT available for `eleven_v3` model.
+
+### Context Lifecycle
+
+Each LLM response uses one context_id for prosodic consistency:
+
+```python
+# 1. Start new context for response
+context_id = await tts.start_response()
+
+# 2. Stream tokens as they arrive from LLM
+for token in llm_stream:
+    await tts.stream_token(token)  # voice_settings on first message only
+
+# 3. End context when response complete
+await tts.end_response()
+```
+
+### Voice Settings (First Message Only)
+
+Per ElevenLabs docs, `voice_settings` only sent on first message per context:
+
+```python
+# First message in context includes voice_settings
+message = {
+    "text": token,
+    "context_id": context_id,
+    "voice_settings": {
+        "stability": 0.5,
+        "similarity_boost": 0.75
+    }
+}
+
+# Subsequent messages omit voice_settings
+message = {
+    "text": token,
+    "context_id": context_id
+}
+```
+
+### Sentence-Level Flushing
+
+Flush at sentence boundaries for natural speech:
+
+```python
+# After streaming tokens
+if token.endswith(('.', '!', '?')):
+    await ws.send_json({
+        "context_id": context_id,
+        "flush": True
+    })
+```
+
+**Why flush?** ElevenLabs buffers text for context. Flushing forces generation, improving responsiveness while maintaining quality.
+
+### Handling Barge-In (Interruption)
+
+When user speaks during AGENT_SPEAKING:
+
+```python
+async def handle_barge_in():
+    # Close current context immediately (non-blocking)
+    await ws.send_json({
+        "context_id": current_context_id,
+        "close_context": True
+    })
+
+    # Capture intended vs spoken for context
+    intended_words = words_sent.copy()
+    spoken_words = words_spoken.copy()
+
+    # Reset state
+    active = False
+```
+
+### Keep-Alive for Long Pauses
+
+Contexts timeout after 20 seconds of inactivity. During LLM thinking:
+
+```python
+async def keep_context_alive():
+    await ws.send_json({
+        "context_id": context_id,
+        "text": ""  # Empty text resets timeout clock
+    })
+```
+
+### Word-Level Tracking
+
+Track words sent to TTS vs words actually spoken for accurate interruption context:
+
+```python
+# As tokens stream
+words_sent.extend(token.split())
+
+# As audio chunks received
+words_spoken.append(pending_words.pop(0))
+
+# On interruption
+intended = " ".join(words_sent)      # Full response
+spoken = " ".join(words_spoken)      # What caller heard
+```
+
+### Response Handling
+
+ElevenLabs uses **camelCase** in responses:
+
+```python
+data = json.loads(message)
+context_id = data.get("contextId")  # Note: camelCase
+
+if data.get("audio"):
+    # Binary audio data (base64 in JSON responses)
+    pass
+
+if data.get("is_final"):
+    # Context audio generation complete
+    # Mark all pending words as spoken
+    pass
+```
 
 ### Gatekeeper Function
 
-The output layer is the gatekeeper for all agent audio. Before streaming anything to ElevenLabs:
+The output layer is the gatekeeper for all agent audio:
 
 ```python
 def can_output():
-    return not elevenlabs_output_active
+    return not state.active
 
-def wait_for_output_idle():
-    while elevenlabs_output_active:
-        await asyncio.sleep(10)  # 10ms polling
+async def wait_for_idle(timeout_ms=10000):
+    while state.active and elapsed < timeout_ms:
+        await asyncio.sleep(0.01)  # 10ms polling
 ```
 
 ### Output Priority
 
-1. **Deepgram transcribing** = Hard interrupt. Stop all output immediately.
+1. **Deepgram StartOfTurn** = Hard interrupt. Close context immediately.
 2. **ElevenLabs active** = Soft lock. New output waits.
-3. **Backchannels and Claude responses** = Must wait for idle output layer.
+3. **Backchannels** = Use HTTP streaming (faster for short text).
+4. **Claude responses** = Use Multi-Context WebSocket.
 
-### Position Tracking
+### Backchannel via HTTP
 
-Track output position for interruption handling:
+Backchannels use HTTP streaming for lower latency (no context overhead):
 
 ```python
-class ElevenLabsOutput:
-    def __init__(self):
-        self.active = False
-        self.total_text = ""
-        self.output_position = 0  # Characters actually spoken
+async def speak_backchannel(text):
+    if state.active:
+        return False  # Skip if main response playing
 
-    def on_audio_chunk_sent(self, chunk_text_length):
-        self.output_position += chunk_text_length
+    # HTTP endpoint for short utterances
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+    async with session.post(url, json={"text": text, ...}) as response:
+        async for chunk in response.content.iter_chunked(4096):
+            publish_audio(chunk)
+```
 
-    def get_spoken_text(self):
-        return self.total_text[:self.output_position]
+### Connection Lifecycle
 
-    def get_intended_text(self):
-        return self.total_text
+```python
+# On session start
+await tts.connect()  # Single WebSocket for entire call
+
+# During call
+for response in responses:
+    await tts.start_response()
+    for token in tokens:
+        await tts.stream_token(token)
+    await tts.end_response()
+
+# On session end
+await tts.disconnect()  # Sends close_socket: true
+```
+
+### Limits and Timeouts
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Max concurrent contexts | 5 | Per WebSocket connection |
+| Inactivity timeout | 20s | Default, up to 180s configurable |
+| Max message size | 16MB | For audio responses |
+
+---
+
+## 7. Emotion Detection Layer (Hume AI + SharedAudioBuffer)
+
+### Overview
+
+The Emotion Detection Layer provides real-time emotional context from user speech prosody. It uses Hume AI's Expression Measurement API to analyze voice characteristics (pitch, tempo, intensity) and correlate emotions with Deepgram transcripts using a shared `context_id`.
+
+### Why Emotion Detection?
+
+| Without Emotion | With Emotion |
+|-----------------|--------------|
+| "I need help with my order" | `<frustration confidence="0.78">I need help with my order</frustration>` |
+| LLM responds neutrally | LLM responds empathetically, acknowledges frustration |
+| Generic tone | Tailored emotional response |
+
+### Architecture: Dual-Stream Processing
+
+```
+                         User Audio Stream
+                                │
+                    ┌───────────┴───────────┐
+                    │   SharedAudioBuffer   │
+                    │   (generates context_id)
+                    └───────────┬───────────┘
+                                │
+            ┌───────────────────┼───────────────────┐
+            │                   │                   │
+            ▼                   ▼                   ▼
+    ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+    │  Deepgram   │     │  Hume AI    │     │   Audio     │
+    │  (STT)      │     │  (Prosody)  │     │   Context   │
+    │             │     │             │     │   Storage   │
+    └──────┬──────┘     └──────┬──────┘     └─────────────┘
+           │                   │
+           │ transcript        │ emotions
+           │                   │
+           ▼                   ▼
+    ┌──────────────────────────────────────┐
+    │    EndOfTurn: Correlate by context_id │
+    │    Output: <emotion>transcript</emotion> │
+    └──────────────────────────────────────┘
+```
+
+### SharedAudioBuffer: The Central Coordinator
+
+The `SharedAudioBuffer` is the central audio routing layer that:
+
+1. **Generates `context_id`** on first audio chunk of a turn
+2. **Routes audio** to both Deepgram (real-time, every chunk) and Hume (batched, 500ms intervals)
+3. **Correlates results** by `context_id`
+4. **At EndOfTurn**, returns emotion-tagged transcript
+
+```python
+class SharedAudioBuffer:
+    def receive_audio(self, chunk: bytes) -> str:
+        """
+        Receive audio from LiveKit.
+        Returns context_id for this turn.
+        """
+        # Create context on first chunk
+        if not self._current_context:
+            context_id = self._generate_context_id()
+            self._current_context = AudioContext(context_id=context_id)
+
+        # Route to Deepgram (every chunk)
+        await self._on_audio_for_deepgram(context_id, chunk)
+
+        # Batch for Hume (500ms intervals)
+        self._hume_buffer.append(chunk)
+        self._maybe_send_to_hume(context_id)
+
+        return context_id
+
+    def end_turn(self, context_id: str, final_transcript: str) -> str:
+        """
+        End turn and return emotion-tagged transcript.
+        ZERO LATENCY: Reads latest_emotion directly from HumeHandler.
+        """
+        # Read emotion (already updated via continuous prediction)
+        if self._hume_handler and self._hume_handler.has_emotion:
+            emotion, confidence = self._hume_handler.get_top_emotion()
+            category = map_to_category(emotion)
+            return f'<{category} confidence="{confidence:.2f}">{final_transcript}</{category}>'
+
+        # Graceful degradation: return neutral if Hume unavailable
+        return f'<neutral confidence="0.50">{final_transcript}</neutral>'
+```
+
+### HumeHandler: Real-Time Prosody Analysis
+
+Connects to Hume AI's Expression Measurement WebSocket API for continuous emotion detection:
+
+```python
+class HumeHandler:
+    HUME_WS_URL = "wss://api.hume.ai/v0/stream/models"
+
+    # Continuous prediction: always-updated latest emotion
+    _latest_emotion: Optional[Dict[str, float]] = None
+
+    async def send_audio(self, audio_bytes: bytes) -> bool:
+        """Send audio for prosody analysis."""
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+        message = {
+            "data": audio_b64,
+            "models": {"prosody": {}},
+            "raw_text": False,
+            "stream_window_ms": 500
+        }
+
+        await self._ws.send_json(message)
+
+    def get_top_emotion(self) -> Tuple[str, float]:
+        """Get top emotion from latest prediction."""
+        if not self._latest_emotion:
+            return ("neutral", 0.5)
+        return max(self._latest_emotion.items(), key=lambda x: x[1])
+```
+
+### Continuous Prediction Pattern (Zero Latency)
+
+Unlike request-response patterns that add latency, we use **continuous prediction**:
+
+```
+                    Audio streaming...
+                         │
+    ┌──────────────────────────────────────────────┐
+    │                  Timeline                     │
+    ├──────┬──────┬──────┬──────┬──────┬──────┬────┤
+    │  0ms │ 500ms│1000ms│1500ms│2000ms│ EOT  │    │
+    │      │      │      │      │      │      │    │
+    │ Hume │ Hume │ Hume │ Hume │ Hume │ Read │    │
+    │ send │ recv │ send │ recv │ send │ latest    │
+    │      │ updt │      │ updt │      │ emotion   │
+    └──────┴──────┴──────┴──────┴──────┴──────┴────┘
+                                         ▲
+                                         │
+                                    Zero wait!
+```
+
+At EndOfTurn, we simply read `_latest_emotion` - no waiting required.
+
+### Emotion Categories (Hume's 48 → Simplified 10)
+
+Hume detects 48 prosody emotions. We map to simplified categories for LLM prompting:
+
+| Category | Hume Emotions |
+|----------|---------------|
+| `joy` | Amusement, Joy, Excitement, Interest, Satisfaction |
+| `calm` | Calmness, Contentment, Relief, Serenity |
+| `interest` | Interest, Curiosity, Concentration, Contemplation |
+| `frustration` | Frustration, Annoyance, Irritation |
+| `anger` | Anger, Contempt, Disgust |
+| `sadness` | Sadness, Disappointment, Distress |
+| `anxiety` | Anxiety, Fear, Nervousness, Worry |
+| `confusion` | Confusion, Doubt, Awkwardness |
+| `surprise` | Surprise, Awe, Amazement |
+| `neutral` | Neutral, Boredom, Tiredness |
+
+### Integration with State Machine
+
+Emotion detection integrates seamlessly with Flux turn events:
+
+```python
+# On StartOfTurn
+self._shared_buffer.cancel_turn()  # Clear previous context
+self._hume_handler.clear_emotion()  # Reset emotion state
+
+# On audio chunk received
+context_id = self._shared_buffer.receive_audio(chunk)
+
+# On EndOfTurn
+tagged_transcript = self._shared_buffer.end_turn(
+    context_id=context_id,
+    final_transcript=deepgram_transcript
+)
+# Output: "<calm confidence=\"0.72\">I need to schedule an appointment</calm>"
+
+# Send to LLM with emotion context
+await self._llm_client.generate_response(tagged_transcript)
+```
+
+### Hume API Configuration
+
+```python
+@dataclass
+class HumeConfig:
+    api_key: str
+    models: List[str] = ["prosody"]  # Speech emotion analysis
+```
+
+Connection URL: `wss://api.hume.ai/v0/stream/models`
+
+Authentication: `X-Hume-Api-Key` header
+
+### Graceful Degradation
+
+If Hume is unavailable, the system degrades gracefully:
+
+1. **Circuit breaker opens** after 5 consecutive failures
+2. **Degraded mode active**: Skip sending audio to Hume
+3. **Neutral fallback**: Return `<neutral confidence="0.50">transcript</neutral>`
+4. **Auto-recovery**: Circuit breaker allows retry after 30 seconds
+
+```python
+# In SharedAudioBuffer.end_turn()
+if self._hume_handler.is_degraded:
+    # Graceful degradation: return neutral
+    return f'<neutral confidence="0.50">{final_transcript}</neutral>'
 ```
 
 ---
 
-## 7. Universal Prompt Format
+## 8. Production Resilience Layer
+
+### Overview
+
+The Production Resilience Layer provides fault tolerance for external service integrations (Hume AI, ElevenLabs). It ensures the voice pipeline continues operating even when dependencies fail.
+
+### Resilience Patterns
+
+| Pattern | Purpose | Implementation |
+|---------|---------|----------------|
+| Circuit Breaker | Fail fast after repeated failures | 5 failures → open, 30s timeout → half-open |
+| Exponential Backoff | Prevent thundering herd | 500ms → 5s with jitter |
+| Graceful Degradation | Continue without failed service | Return neutral emotion / skip TTS |
+| Health Checks | Monitor and recover | Periodic health_check() with auto-recovery |
+
+### Circuit Breaker
+
+```
+         Failures < threshold                    timeout elapsed
+              ┌────────┐                           ┌────────┐
+              │        │                           │        │
+              ▼        │                           ▼        │
+         ┌────────┐    │    failure threshold  ┌────────────┐
+ ───────▶│ CLOSED │────┴─────────────────────▶│   OPEN     │
+         └────┬───┘                            └─────┬──────┘
+              │                                      │
+              │ success                              │ timeout
+              │                                      │ elapsed
+              │         ┌───────────────┐            │
+              └─────────│  HALF-OPEN    │◀───────────┘
+                        └───────┬───────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+               success                  failure
+                    │                       │
+                    ▼                       ▼
+               ┌────────┐             ┌────────┐
+               │ CLOSED │             │  OPEN  │
+               └────────┘             └────────┘
+```
+
+### Configuration
+
+```python
+@dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 5      # Failures before opening
+    success_threshold: int = 2      # Successes to close from half-open
+    timeout_seconds: float = 30.0   # Time before attempting recovery
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    base_delay_ms: int = 500
+    max_delay_ms: int = 5000
+    exponential_base: float = 2.0
+    jitter_factor: float = 0.1      # 10% randomization
+```
+
+### Error Classification
+
+Errors are classified to determine retry strategy:
+
+| Error Type | Action | Examples |
+|------------|--------|----------|
+| `TRANSIENT` | Retry immediately | Network timeout, connection reset |
+| `THROTTLED` | Back off significantly | Rate limit (429), too many requests |
+| `PERMANENT` | Don't retry | Auth failed (401/403), bad request (400) |
+| `UNKNOWN` | Retry with caution | Unexpected errors |
+
+```python
+def classify_error(error: Exception) -> ClassifiedError:
+    """Classify error to determine retry strategy."""
+    if is_rate_limit(error):
+        return ClassifiedError(ErrorType.THROTTLED, should_retry=True)
+    if is_auth_error(error):
+        return ClassifiedError(ErrorType.PERMANENT, should_retry=False)
+    if is_connection_error(error):
+        return ClassifiedError(ErrorType.TRANSIENT, should_retry=True)
+    return ClassifiedError(ErrorType.UNKNOWN, should_retry=True)
+```
+
+### Resilience in HumeHandler
+
+```python
+class HumeHandler:
+    CONNECT_TIMEOUT_SECONDS = 10.0
+    SEND_TIMEOUT_SECONDS = 5.0
+
+    def __init__(self, enable_circuit_breaker: bool = True):
+        if enable_circuit_breaker:
+            self._circuit_breaker = CircuitBreaker(
+                name="hume",
+                config=CircuitBreakerConfig(
+                    failure_threshold=5,
+                    success_threshold=2,
+                    timeout_seconds=30.0
+                )
+            )
+
+        self._retry_config = RetryConfig(
+            max_retries=3,
+            base_delay_ms=500,
+            max_delay_ms=5000
+        )
+
+    async def connect(self) -> bool:
+        # Check circuit breaker first
+        if not self._circuit_breaker.can_execute():
+            self._degraded = True
+            return False
+
+        # Retry with backoff
+        await retry_with_backoff(
+            self._do_connect,
+            config=self._retry_config
+        )
+
+    async def send_audio(self, audio_bytes: bytes) -> bool:
+        # Circuit breaker check
+        if not self._circuit_breaker.can_execute():
+            return False  # Graceful degradation
+
+        # Send with timeout
+        await asyncio.wait_for(
+            self._ws.send_json(message),
+            timeout=self.SEND_TIMEOUT_SECONDS
+        )
+```
+
+### Resilience in TTSOutput
+
+```python
+class TTSOutput:
+    CONNECT_TIMEOUT_SECONDS = 10.0
+    SEND_TIMEOUT_SECONDS = 5.0
+    HTTP_TIMEOUT_SECONDS = 15.0
+
+    async def connect(self) -> bool:
+        # Circuit breaker + retry with backoff
+        if not self._circuit_breaker.can_execute():
+            self._degraded = True
+            return False
+
+        await retry_with_backoff(
+            self._do_connect,
+            config=self._retry_config
+        )
+
+    async def stream_token(self, token: str) -> None:
+        # Circuit breaker check
+        if not self._circuit_breaker.can_execute():
+            return  # Silent failure, don't block
+
+        # Send with timeout
+        await asyncio.wait_for(
+            self._ws.send_json(message),
+            timeout=self.SEND_TIMEOUT_SECONDS
+        )
+```
+
+### Health Checks
+
+Both handlers expose health check methods for monitoring:
+
+```python
+async def health_check(self) -> Dict[str, Any]:
+    """Perform health check with auto-recovery."""
+    health = {
+        "service": "hume",
+        "connected": self._connected,
+        "degraded": self._degraded,
+        "circuit_state": self.circuit_state,
+        "consecutive_failures": self._consecutive_failures
+    }
+
+    # Attempt recovery if degraded but circuit closed
+    if self._degraded and self._circuit_breaker.state == CircuitState.CLOSED:
+        connected = await self.connect()
+        if connected:
+            self._degraded = False
+            health["recovered"] = True
+
+    return health
+```
+
+### Timeout Constants
+
+| Operation | HumeHandler | TTSOutput |
+|-----------|-------------|-----------|
+| Connect | 10s | 10s |
+| Send | 5s | 5s |
+| HTTP Request | - | 15s |
+
+---
+
+## 9. Universal Prompt Format
 
 ### Structure
 
-Every LLM invocation uses a consistent format:
+Every LLM invocation uses a consistent format with **emotion-tagged user input**:
 
 ```xml
 <agent_previous>
@@ -448,10 +1030,24 @@ Every LLM invocation uses a consistent format:
   <spoken>{text that was actually outputted as audio}</spoken>
 </agent_previous>
 
-<user_input>{current_buffer}</user_input>
+<user_input>
+  <{emotion} confidence="{0.XX}">{current_buffer}</{emotion}>
+</user_input>
 ```
 
-### Example: No Interruption
+### Emotion Tag Format
+
+User input is wrapped with the detected emotion from Hume AI:
+
+```xml
+<{emotion_category} confidence="{confidence_score}">{transcript}</{emotion_category}>
+```
+
+**Categories**: `joy`, `calm`, `interest`, `frustration`, `anger`, `sadness`, `anxiety`, `confusion`, `surprise`, `neutral`
+
+**Confidence**: 0.00 - 1.00 (higher = more confident)
+
+### Example: Calm User (No Interruption)
 
 ```xml
 <agent_previous>
@@ -459,10 +1055,12 @@ Every LLM invocation uses a consistent format:
   <spoken>I can help you schedule that appointment for Tuesday at 3pm.</spoken>
 </agent_previous>
 
-<user_input>Actually, can we do Wednesday instead?</user_input>
+<user_input>
+  <calm confidence="0.72">Actually, can we do Wednesday instead?</calm>
+</user_input>
 ```
 
-### Example: User Interrupted Agent
+### Example: Frustrated User Interrupted Agent
 
 ```xml
 <agent_previous>
@@ -470,8 +1068,12 @@ Every LLM invocation uses a consistent format:
   <spoken>I can help you schedule that appointment for Tuesday at</spoken>
 </agent_previous>
 
-<user_input>Wait, I need to check my calendar first.</user_input>
+<user_input>
+  <frustration confidence="0.78">Wait, I need to check my calendar first.</frustration>
+</user_input>
 ```
+
+**Note**: The LLM can now detect the user's frustration and respond with appropriate empathy.
 
 ### Example: User Interrupted During Prompting
 
@@ -483,12 +1085,26 @@ When user speaks again before Claude responds:
   <spoken></spoken>
 </agent_previous>
 
-<interrupted_context>{what user initially said before prompting}</interrupted_context>
+<interrupted_context>
+  <calm confidence="0.65">{what user initially said before prompting}</calm>
+</interrupted_context>
 
-<user_input>{what user added after interrupting}</user_input>
+<user_input>
+  <anxiety confidence="0.58">{what user added after interrupting}</anxiety>
+</user_input>
 ```
 
-### Conversation History
+### Example: Graceful Degradation (Hume Unavailable)
+
+When Hume AI is unavailable, neutral emotion with 0.50 confidence is returned:
+
+```xml
+<user_input>
+  <neutral confidence="0.50">I need help with my order.</neutral>
+</user_input>
+```
+
+### Conversation History with Emotions
 
 Stack these blocks for full conversation context:
 
@@ -498,7 +1114,9 @@ Stack these blocks for full conversation context:
     <intended>Hello, this is ThreadiaVA. How can I help you today?</intended>
     <spoken>Hello, this is ThreadiaVA. How can I help you today?</spoken>
   </agent_previous>
-  <user_input>Hi, I need to schedule an appointment.</user_input>
+  <user_input>
+    <calm confidence="0.68">Hi, I need to schedule an appointment.</calm>
+  </user_input>
 </turn>
 
 <turn index="2">
@@ -506,7 +1124,9 @@ Stack these blocks for full conversation context:
     <intended>I'd be happy to help you schedule an appointment. What day works best for you?</intended>
     <spoken>I'd be happy to help you schedule an appointment. What day</spoken>
   </agent_previous>
-  <user_input>Tuesday, wait no, let me check... Wednesday would be better.</user_input>
+  <user_input>
+    <confusion confidence="0.71">Tuesday, wait no, let me check... Wednesday would be better.</confusion>
+  </user_input>
 </turn>
 
 <current_turn>
@@ -514,13 +1134,33 @@ Stack these blocks for full conversation context:
     <intended></intended>
     <spoken></spoken>
   </agent_previous>
-  <user_input>Yeah Wednesday at 3pm if possible.</user_input>
+  <user_input>
+    <interest confidence="0.62">Yeah Wednesday at 3pm if possible.</interest>
+  </user_input>
 </current_turn>
+```
+
+### LLM System Prompt for Emotion Awareness
+
+Include instructions for the LLM to leverage emotion tags:
+
+```
+You are a voice agent for {business_name}. The user's speech includes emotion tags
+detected from their voice prosody. Use these to tailor your responses:
+
+- <frustration>: Acknowledge their frustration, be more concise and solution-focused
+- <anxiety>: Be reassuring, speak calmly, offer clear next steps
+- <confusion>: Clarify and simplify, ask confirming questions
+- <joy>: Match their energy, be enthusiastic
+- <calm>: Maintain professional, conversational tone
+
+The confidence score (0.0-1.0) indicates how certain the emotion detection is.
+High confidence (>0.7) suggests strong emotional signal.
 ```
 
 ---
 
-## 8. Interruption Handling
+## 10. Interruption Handling
 
 ### Detection
 
@@ -576,7 +1216,7 @@ def handle_interruption_speaking():
 
 ---
 
-## 9. Timing and Configuration Constants
+## 11. Timing and Configuration Constants
 
 ### Flux-Managed (No Manual Timers)
 
@@ -610,49 +1250,105 @@ These constants are only used when `model=nova-3` (manual turn detection mode):
 
 ---
 
-## 10. Component Integration Summary
+## 12. Component Integration Summary
+
+### ThreadiaVA Engine Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        LIVEKIT CLOUD                            │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │   Twilio    │───▶│  SIP/RTP    │───▶│       Room          │  │
-│  │  (PSTN)     │    │  Endpoint   │    │  ┌──────┐ ┌──────┐  │  │
-│  └─────────────┘    └─────────────┘    │  │Caller│ │Agent │  │  │
-│                                        │  └──┬───┘ └──┬───┘  │  │
-│                                        └─────┼────────┼──────┘  │
-└──────────────────────────────────────────────┼────────┼─────────┘
-                                               │        │
-                    ┌──────────────────────────┘        │
-                    │ Audio Track                       │ Audio Track
-                    ▼                                   ▲
-┌─────────────────────────────────────────────────────────────────┐
-│                         AGENT CODE                              │
-│                                                                 │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │  Deepgram   │───▶│   State     │───▶│   Claude (LLM)      │  │
-│  │  (STT)      │    │  Machine    │    │                     │  │
-│  └─────────────┘    └──────┬──────┘    └──────────┬──────────┘  │
-│        │                   │                      │             │
-│        │ Transcripts       │ Decisions            │ Tokens      │
-│        │ Events            │                      │             │
-│        ▼                   ▼                      ▼             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │  Buffers    │    │ Backchannel │    │   ElevenLabs        │  │
-│  │             │    │   System    │───▶│   (TTS)             │  │
-│  └─────────────┘    └─────────────┘    └──────────┬──────────┘  │
-│                                                   │             │
-│                                                   │ Audio       │
-│                                                   ▼             │
-│                                        ┌─────────────────────┐  │
-│                                        │  Output to Caller   │  │
-│                                        └─────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              LIVEKIT CLOUD                                   │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────────┐  │
+│  │   Twilio    │───▶│  SIP/RTP    │───▶│             Room                │  │
+│  │  (PSTN)     │    │  Endpoint   │    │  ┌──────────┐  ┌──────────────┐ │  │
+│  └─────────────┘    └─────────────┘    │  │  Caller  │  │    Agent     │ │  │
+│                                        │  └────┬─────┘  └──────┬───────┘ │  │
+│                                        └───────┼───────────────┼─────────┘  │
+└────────────────────────────────────────────────┼───────────────┼────────────┘
+                                                 │               │
+                          ┌──────────────────────┘               │
+                          │ Audio Track                          │ Audio Track
+                          ▼                                      ▲
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         THREADIAVA ENGINE (Agent Code)                       │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                      SharedAudioBuffer                                  │ │
+│  │                   (generates context_id per turn)                       │ │
+│  └───────────┬───────────────────────────────────────────────┬─────────────┘ │
+│              │                                               │               │
+│              │ Audio chunks                                  │ Audio batches │
+│              ▼                                               ▼               │
+│  ┌─────────────────────────┐                    ┌─────────────────────────┐  │
+│  │      Deepgram Flux      │                    │       Hume AI           │  │
+│  │         (STT)           │                    │      (Prosody)          │  │
+│  │ StartOfTurn, EndOfTurn  │                    │   emotion detection     │  │
+│  └───────────┬─────────────┘                    └───────────┬─────────────┘  │
+│              │ Transcripts + Events                         │ Emotions       │
+│              │                                              │                │
+│              ▼                                              ▼                │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                           State Machine                                 │ │
+│  │    LISTENING → SHORT_PAUSE → PROMPTING → AGENT_SPEAKING → LISTENING    │ │
+│  └────────────────────────────────┬────────────────────────────────────────┘ │
+│                                   │                                          │
+│              ┌────────────────────┼────────────────────┐                     │
+│              │                    │                    │                     │
+│              ▼                    ▼                    ▼                     │
+│  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐            │
+│  │   BufferManager │   │  Backchannel    │   │   LLM Client    │            │
+│  │   (word-level)  │   │     System      │   │  (Claude/AWS)   │            │
+│  └────────┬────────┘   └────────┬────────┘   └────────┬────────┘            │
+│           │                     │                     │                      │
+│           │ context             │ short utterances    │ tokens (stream)      │
+│           ▼                     ▼                     ▼                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                    ElevenLabs TTS (Multi-Context)                       │ │
+│  │              circuit breaker + retry + graceful degradation             │ │
+│  └───────────────────────────────────┬─────────────────────────────────────┘ │
+│                                      │ Audio                                 │
+│                                      ▼                                       │
+│                            ┌─────────────────────┐                           │
+│                            │  Publish to Caller  │                           │
+│                            └─────────────────────┘                           │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                     Production Resilience Layer                         │ │
+│  │   Circuit Breaker │ Exponential Backoff │ Graceful Degradation │ Health │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Summary
+
+```
+Audio In → SharedAudioBuffer → context_id generated
+                │
+    ┌───────────┴───────────┐
+    │                       │
+    ▼                       ▼
+Deepgram (STT)         Hume AI (Emotion)
+    │                       │
+    │ transcript            │ emotions dict
+    │                       │
+    ▼                       ▼
+EndOfTurn ────────────────────────────▶ SharedAudioBuffer.end_turn()
+                                              │
+                                              ▼
+                              <emotion>transcript</emotion>
+                                              │
+                                              ▼
+                                        LLM (Claude)
+                                              │
+                                              ▼
+                                        ElevenLabs TTS
+                                              │
+                                              ▼
+                                        Audio Out
 ```
 
 ---
 
-## 11. Implementation Checklist
+## 13. Implementation Checklist
 
 ### LiveKit Setup
 - [ ] Create LiveKit Cloud account
@@ -698,11 +1394,18 @@ These constants are only used when `model=nova-3` (manual turn detection mode):
 - [x] Skip duplicate LLM on EndOfTurn if eager already sent
 - [x] Cancel in-flight requests on interruption
 
-### TTS Integration (ElevenLabs)
-- [ ] Configure TTS streaming
-- [ ] Implement output active tracking
-- [ ] Add position tracking for interruptions
-- [ ] Implement gatekeeper pattern
+### TTS Integration (ElevenLabs Multi-Context WebSocket)
+- [x] Multi-Context WebSocket connection with `model_id` parameter
+- [x] Context lifecycle management (`start_response`, `stream_token`, `end_response`)
+- [x] Voice settings on first message per context
+- [x] Sentence-level flushing for natural prosody
+- [x] Barge-in handling via `close_context`
+- [x] Keep-alive for context timeout prevention
+- [x] Word-level tracking (`words_sent` vs `words_spoken`)
+- [x] Response handling with camelCase `contextId` and `is_final`
+- [x] Gatekeeper pattern (soft lock, hard interrupt)
+- [x] HTTP fallback for backchannels (lower latency)
+- [x] BufferManager integration for interruption context
 
 ### Prompt Engineering
 - [x] Universal prompt format with intended/spoken
@@ -719,7 +1422,29 @@ These constants are only used when `model=nova-3` (manual turn detection mode):
 
 ---
 
-## 12. Error Handling Considerations
+### Emotion Detection (Hume AI + SharedAudioBuffer)
+- [x] SharedAudioBuffer with context_id generation
+- [x] HumeHandler WebSocket connection
+- [x] Continuous prediction pattern (zero latency at EndOfTurn)
+- [x] Emotion category mapping (48 → 10)
+- [x] Emotion-tagged transcript output
+- [x] Graceful degradation (neutral fallback when Hume unavailable)
+- [x] Circuit breaker protection for Hume
+- [x] Integration with state machine and LLM prompts
+
+### Production Resilience
+- [x] `resilience.py` module with error classification
+- [x] Circuit breaker pattern (5 failures → open, 30s recovery)
+- [x] Exponential backoff with jitter (500ms → 5s)
+- [x] Graceful degradation for all external services
+- [x] Health check methods with auto-recovery
+- [x] Timeout enforcement on all async operations
+- [x] HumeHandler resilience integration
+- [x] TTSOutput resilience integration
+
+---
+
+## 14. Error Handling Considerations
 
 ### Deepgram Latency Spike
 If Deepgram hasn't emitted words for an unusually long time despite audio flowing:
@@ -741,7 +1466,7 @@ If Claude tokens are streaming but ElevenLabs hasn't started output:
 
 ---
 
-## 13. Future Enhancements
+## 15. Future Enhancements
 
 ### v2 Considerations
 - Audio event classification (coughs, laughter) for contextual responses
@@ -751,7 +1476,7 @@ If Claude tokens are streaming but ElevenLabs hasn't started output:
 
 ---
 
-## 14. Configuration Architecture
+## 16. Configuration Architecture
 
 ### Static vs Dynamic Configuration
 
@@ -811,7 +1536,7 @@ Comes from frontend via SIP headers or room metadata:
 
 ---
 
-## 15. Edge Cases and State Machine Behavior
+## 17. Edge Cases and State Machine Behavior
 
 This section documents how the Flux-driven state machine handles edge cases.
 
@@ -954,13 +1679,45 @@ These invariants must always hold:
 
 ## Changelog
 
-### Version 1.3 (December 4, 2024)
+### Version 1.5 (December 4, 2024)
+- **Major Update**: Emotion Detection Layer with Hume AI integration (Section 7)
+- **Major Update**: Production Resilience Layer (Section 8)
+- **Added**: SharedAudioBuffer for dual-stream audio routing (Deepgram + Hume)
+- **Added**: HumeHandler for real-time prosody emotion detection (48 dimensions)
+- **Added**: Continuous prediction pattern for zero-latency emotion lookup at EndOfTurn
+- **Added**: Emotion category mapping (Hume's 48 → simplified 10 categories)
+- **Added**: Emotion-tagged transcript format: `<emotion confidence="X.XX">text</emotion>`
+- **Added**: `resilience.py` module with production-grade error handling
+- **Added**: Circuit breaker pattern (5 failures → open, 30s timeout → half-open)
+- **Added**: Exponential backoff with jitter (500ms → 5s, 10% jitter)
+- **Added**: Error classification (transient, throttled, permanent)
+- **Added**: Graceful degradation (neutral emotion fallback, silent TTS failure)
+- **Added**: Health check methods with auto-recovery for HumeHandler and TTSOutput
+- **Updated**: Universal Prompt Format (Section 9) - now includes emotion tags
+- **Updated**: Component Integration Diagram - shows ThreadiaVA Engine architecture
+- **Updated**: Implementation Checklist - all emotion detection and resilience items complete
+- **Renamed**: Sections renumbered to accommodate new sections (7-17)
+
+### Version 1.4 (December 4, 2024)
+- **Major Update**: ElevenLabs Multi-Context WebSocket integration (Section 6)
+- **Added**: Multi-Context WebSocket architecture for natural-sounding streamed TTS
+- **Added**: `context_id` management for prosodic consistency across LLM tokens
+- **Added**: Sentence-level flushing at `.!?` boundaries
+- **Added**: `voice_settings` on first message per context (per ElevenLabs docs)
+- **Added**: Keep-alive method for preventing 20-second context timeout
+- **Added**: Barge-in handling via `close_context` for clean interruptions
+- **Added**: Response handling for camelCase `contextId` and `is_final`
+- **Added**: HTTP fallback for backchannels (lower latency than WebSocket context)
+- **Updated**: Section 11 TTS checklist - all items complete
+- **Updated**: Word-level tracking integrated with TTS output layer
+
+### Version 1.3 (December 4, 2025)
 - **Added**: Word-level TTS tracking (Section 4)
 - **Added**: `agent_response_words` and `agent_spoken_words` buffers
 - **Added**: `mark_words_spoken()` and `mark_words_spoken_by_count()` TTS API
 - **Added**: Word lists in `AgentInterruptedContext` for precise interruption tracking
 
-### Version 1.2 (December 4, 2024)
+### Version 1.2 (December 4, 2025)
 - **Major Update**: Migrated from manual timing to Deepgram Flux event-driven architecture
 - **Updated**: Section 2 (Signal Layer) - Complete Flux documentation with events, guarantees, and configuration
 - **Updated**: Section 3 (State Machine) - All transitions now driven by Flux events, not manual timers
@@ -971,17 +1728,17 @@ These invariants must always hold:
 - **Added**: AWS Bedrock support as alternative LLM backend
 - **Fixed**: Eager LLM race condition (skip duplicate on EndOfTurn if eager already sent)
 
-### Version 1.1 (December 3, 2024)
+### Version 1.1 (December 3, 2025)
 - **Added**: Configuration Architecture section (Section 14)
 - **Clarified**: Voice options come from frontend payload, not .env file
 - **Added**: CallConfig dataclass for per-call dynamic settings
 - **Added**: Support for SIP headers and room metadata parsing
 
-### Version 1.0 (December 2024)
+### Version 1.0 (December 2025)
 - Initial specification document
 
 ---
 
-*Document Version: 1.2*
+*Document Version: 1.5*
 *Last Updated: December 4, 2025*
 *Author: ThreadiaVA Engineering*
